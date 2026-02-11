@@ -1,0 +1,211 @@
+import streamlit as st
+import ccxt
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import datetime
+
+# --- 1. 页面配置 ---
+st.set_page_config(page_title="三级策略哨兵", layout="wide", page_icon="🛡️")
+st.title("🛡️ Crypto Sentinel - 全周期策略可视化")
+
+# --- 2. 侧边栏配置 ---
+st.sidebar.header("🎯 监控设置")
+symbol = st.sidebar.text_input("输入币种 (例如 BTC/USDT)", value="BTC/USDT")
+exchange_id = st.sidebar.selectbox("数据源交易所", ['binance', 'gate', 'okx', 'mexc'])
+
+# --- 3. 核心计算引擎 (不依赖复杂库，纯Pandas实现) ---
+def calculate_indicators(df):
+    # A. 短线指标: Bollinger Bands & RSI
+    df['TP'] = (df['high'] + df['low'] + df['close']) / 3
+    df['std'] = df['TP'].rolling(20).std()
+    df['MA20'] = df['TP'].rolling(20).mean()
+    df['Upper_BB'] = df['MA20'] + 2 * df['std']
+    df['Lower_BB'] = df['MA20'] - 2 * df['std']
+    
+    # RSI 计算
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+
+    # B. 中线指标: MA Cross & MACD
+    df['MA7'] = df['close'].rolling(7).mean()
+    df['MA30'] = df['close'].rolling(30).mean()
+    
+    exp1 = df['close'].ewm(span=12, adjust=False).mean()
+    exp2 = df['close'].ewm(span=26, adjust=False).mean()
+    df['MACD'] = exp1 - exp2
+    df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
+
+    # C. 长线指标: MA200
+    df['MA200'] = df['close'].rolling(200).mean()
+    
+    return df
+
+def fetch_data(symbol, timeframe, limit=300):
+    try:
+        exchange_class = getattr(ccxt, exchange_id)
+        exchange = exchange_class()
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        return calculate_indicators(df)
+    except Exception as e:
+        st.error(f"数据获取失败: {e}")
+        return pd.DataFrame()
+
+# --- 4. 绘图与信号逻辑 ---
+
+# >>> 策略 1: 短线做T (15m/1h) - 回归策略 <<<
+def render_short_term():
+    st.markdown("### 🏹 短线哨兵 (Short-Term): 做T神器")
+    st.info("策略逻辑: 价格触碰布林带下轨+RSI超卖=买入; 触碰上轨+RSI超买=卖出")
+    
+    col1, col2 = st.columns([3, 1])
+    timeframe = col2.selectbox("短线周期", ['15m', '1h'], index=0)
+    
+    df = fetch_data(symbol, timeframe)
+    if df.empty: return
+
+    # 生成信号
+    # 买入信号：收盘价 < 下轨 且 RSI < 35
+    buy_signals = df[(df['close'] < df['Lower_BB']) & (df['RSI'] < 35)]
+    # 卖出信号：收盘价 > 上轨 且 RSI > 65
+    sell_signals = df[(df['close'] > df['Upper_BB']) & (df['RSI'] > 65)]
+
+    # 绘图
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3])
+    
+    # K线
+    fig.add_trace(go.Candlestick(x=df['timestamp'], open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='K线'), row=1, col=1)
+    
+    # 布林带
+    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['Upper_BB'], line=dict(color='rgba(255, 0, 0, 0.5)', width=1), name='上轨'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['Lower_BB'], line=dict(color='rgba(0, 255, 0, 0.5)', width=1), name='下轨'), row=1, col=1)
+
+    # 标记信号
+    fig.add_trace(go.Scatter(mode='markers', x=buy_signals['timestamp'], y=buy_signals['low']*0.995, 
+                             marker=dict(symbol='triangle-up', color='green', size=12), name='买入做T'), row=1, col=1)
+    fig.add_trace(go.Scatter(mode='markers', x=sell_signals['timestamp'], y=sell_signals['high']*1.005, 
+                             marker=dict(symbol='triangle-down', color='red', size=12), name='卖出做T'), row=1, col=1)
+
+    # RSI
+    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['RSI'], line=dict(color='purple', width=2), name='RSI'), row=2, col=1)
+    fig.add_hline(y=70, line_dash="dot", row=2, col=1, line_color="red")
+    fig.add_hline(y=30, line_dash="dot", row=2, col=1, line_color="green")
+
+    fig.update_layout(height=600, margin=dict(l=20, r=20, t=20, b=20))
+    st.plotly_chart(fig, use_container_width=True)
+
+    # 实时提醒
+    last_row = df.iloc[-1]
+    if last_row['close'] < last_row['Lower_BB']:
+        st.warning(f"⚠️ 现价低于布林下轨！RSI: {last_row['RSI']:.2f} - 关注反弹机会")
+    elif last_row['close'] > last_row['Upper_BB']:
+        st.warning(f"⚠️ 现价高于布林上轨！RSI: {last_row['RSI']:.2f} - 只有回调风险")
+    else:
+        st.success("目前价格在布林带通道内，无极端信号。")
+
+
+# >>> 策略 2: 中线波段 (4h/1d) - 趋势策略 <<<
+def render_medium_term():
+    st.markdown("### 🌊 中线哨兵 (Medium-Term): 趋势冲浪")
+    st.info("策略逻辑: MA7上穿MA30(金叉)=持币; MA7下穿MA30(死叉)=空仓")
+
+    col1, col2 = st.columns([3, 1])
+    timeframe = col2.selectbox("中线周期", ['4h', '1d'], index=0)
+    
+    df = fetch_data(symbol, timeframe, limit=100)
+    if df.empty: return
+
+    # 绘图
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(x=df['timestamp'], open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='K线'))
+    
+    # 均线
+    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['MA7'], line=dict(color='orange', width=2), name='MA7 (快线)'))
+    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['MA30'], line=dict(color='blue', width=2), name='MA30 (慢线)'))
+
+    # 判断当前趋势
+    last_row = df.iloc[-1]
+    trend = "UP" if last_row['MA7'] > last_row['MA30'] else "DOWN"
+    
+    # 背景色暗示
+    bg_color = "rgba(0, 255, 0, 0.05)" if trend == "UP" else "rgba(255, 0, 0, 0.05)"
+    fig.update_layout(plot_bgcolor=bg_color, height=500)
+    
+    st.plotly_chart(fig, use_container_width=True)
+
+    if trend == "UP":
+        st.success(f"📈 当前处于 **上升趋势** (MA7 > MA30)。建议：持币待涨，逢低买入。")
+    else:
+        st.error(f"📉 当前处于 **下跌趋势** (MA7 < MA30)。建议：空仓或谨慎做空。")
+
+
+# >>> 策略 3: 长线周期 (1w/1M) - 价值回归 <<<
+def render_long_term():
+    st.markdown("### 🏔️ 长线哨兵 (Long-Term): 周期定位")
+    st.info("策略逻辑: 价格在MA200之上=牛市区域; 价格在MA200之下=熊市抄底区域")
+
+    col1, col2 = st.columns([3, 1])
+    timeframe = col2.selectbox("长线周期", ['1d', '1w'], index=0) # 长线通常看日线的MA200或周线
+    
+    # 需要更多数据来计算MA200
+    df = fetch_data(symbol, timeframe, limit=300)
+    if df.empty: return
+
+    last_price = df.iloc[-1]['close']
+    ma200 = df.iloc[-1]['MA200']
+    
+    # 计算偏离度
+    deviation = ((last_price - ma200) / ma200) * 100
+    
+    # 仪表盘绘制
+    fig = go.Figure(go.Indicator(
+        mode = "gauge+number+delta",
+        value = last_price,
+        domain = {'x': [0, 1], 'y': [0, 1]},
+        title = {'text': f"当前价格 vs MA200牛熊分界线 (${ma200:.2f})"},
+        delta = {'reference': ma200, 'increasing': {'color': "green"}, 'decreasing': {'color': "red"}},
+        gauge = {
+            'axis': {'range': [ma200 * 0.5, ma200 * 1.5]},
+            'bar': {'color': "darkblue"},
+            'steps': [
+                {'range': [ma200 * 0.5, ma200], 'color': "lightpink"}, # 熊市/低估区
+                {'range': [ma200, ma200 * 1.5], 'color': "lightgreen"}], # 牛市/高估区
+            'threshold': {
+                'line': {'color': "red", 'width': 4},
+                'thickness': 0.75,
+                'value': last_price}
+        }
+    ))
+    
+    fig.update_layout(height=400)
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.metric("距离 MA200 偏离度", f"{deviation:.2f}%")
+    if last_price > ma200:
+        st.success("🟢 市场处于 **牛市** 区域 (价格 > 200日均线)。长线建议：持有底仓。")
+    else:
+        st.warning("🔴 市场处于 **熊市/震荡** 区域 (价格 < 200日均线)。长线建议：开启定投模式。")
+
+
+# --- 5. 主界面选项卡控制 ---
+tab1, tab2, tab3 = st.tabs(["🏹 短线做T (小时级)", "🌊 中线波段 (日线级)", "🏔️ 长线周期 (年线级)"])
+
+with tab1:
+    if st.button("🔄 刷新短线分析", key='btn1'):
+        pass 
+    render_short_term()
+
+with tab2:
+    if st.button("🔄 刷新中线分析", key='btn2'):
+        pass
+    render_medium_term()
+
+with tab3:
+    if st.button("🔄 刷新长线分析", key='btn3'):
+        pass
+    render_long_term()
